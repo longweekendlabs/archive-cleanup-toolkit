@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -u
+
+usage() {
+  cat <<'HELP'
+Usage: find-leftover-archives [ROOT]
+
+Recursively list leftover archive files at any directory depth.
+This command is read-only: it does not extract, move, or delete anything.
+
+Arguments:
+  ROOT    Directory tree to scan (default: current directory)
+
+Reports are written to:
+  ${XDG_STATE_HOME:-$HOME/.local/state}/archive-cleanup-toolkit/
+HELP
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+ROOT="${1:-.}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+REPORT_DIR="$STATE_HOME/archive-cleanup-toolkit"
+REPORT="$REPORT_DIR/leftover-archives-$STAMP.tsv"
+
+if [[ ! -d "$ROOT" ]]; then
+  printf 'ERROR: directory does not exist: %s\n' "$ROOT" >&2
+  exit 1
+fi
+
+ROOT="$(realpath -- "$ROOT")"
+mkdir -p "$REPORT_DIR"
+printf 'TYPE\tROLE\tPATH\n' > "$REPORT"
+
+count=0
+single=0
+primary=0
+secondary=0
+
+classify_archive() {
+  local path="$1"
+  local name="${path##*/}"
+  local lower="${name,,}"
+  local type=""
+  local role="SINGLE_OR_PRIMARY"
+
+  case "$lower" in
+    *.part[0-9]*.rar)
+      type="RAR_SPLIT"
+      local part
+      part="${lower##*.part}"
+      part="${part%.rar}"
+      part="${part//[^0-9]/}"
+      if [[ -n "$part" ]] && (( 10#$part == 1 )); then
+        role="PRIMARY"
+      else
+        role="SECONDARY"
+      fi
+      ;;
+    *.r[0-9][0-9]|*.r[0-9][0-9][0-9])
+      type="RAR_SPLIT"
+      role="SECONDARY"
+      ;;
+    *.rar)
+      type="RAR"
+      ;;
+    *.7z.[0-9][0-9][0-9])
+      type="7Z_SPLIT"
+      if [[ "$lower" == *.7z.001 ]]; then
+        role="PRIMARY"
+      else
+        role="SECONDARY"
+      fi
+      ;;
+    *.7z)
+      type="7Z"
+      ;;
+    *.zip.[0-9][0-9][0-9])
+      type="ZIP_SPLIT"
+      if [[ "$lower" == *.zip.001 ]]; then
+        role="PRIMARY"
+      else
+        role="SECONDARY"
+      fi
+      ;;
+    *.z[0-9][0-9]|*.z[0-9][0-9][0-9])
+      type="ZIP_SPLIT"
+      role="SECONDARY"
+      ;;
+    *.zip|*.zipx)
+      type="ZIP"
+      ;;
+    *.tar.gz|*.tgz)
+      type="TAR_GZ"
+      ;;
+    *.tar.bz2|*.tbz|*.tbz2)
+      type="TAR_BZ2"
+      ;;
+    *.tar.xz|*.txz)
+      type="TAR_XZ"
+      ;;
+    *.tar.zst|*.tzst)
+      type="TAR_ZST"
+      ;;
+    *.tar)
+      type="TAR"
+      ;;
+    *.gz)
+      type="GZIP"
+      ;;
+    *.bz2)
+      type="BZIP2"
+      ;;
+    *.xz)
+      type="XZ"
+      ;;
+    *.zst)
+      type="ZSTD"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  printf '%s\t%s\t%s\n' "$type" "$role" "$path" >> "$REPORT"
+  printf '%s\n' "$path"
+
+  ((count+=1))
+  case "$role" in
+    PRIMARY) ((primary+=1)) ;;
+    SECONDARY) ((secondary+=1)) ;;
+    *) ((single+=1)) ;;
+  esac
+}
+
+printf 'Scanning recursively:\n%s\n\n' "$ROOT"
+
+while IFS= read -r -d '' file; do
+  classify_archive "$file" || true
+done < <(find "$ROOT" -type f -print0 | sort -z)
+
+printf '\nFinished.\n'
+printf 'Archive files found: %s\n' "$count"
+printf 'Single archives or main archive files: %s\n' "$single"
+printf 'First volumes of numbered split sets: %s\n' "$primary"
+printf 'Secondary split volumes: %s\n' "$secondary"
+printf 'Report: %s\n' "$REPORT"
+
+if (( count == 0 )); then
+  printf '\nNo leftover archive files were found.\n'
+fi

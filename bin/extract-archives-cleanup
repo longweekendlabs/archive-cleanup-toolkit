@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Sequentially extract ZIP/RAR/7z archives and optionally delete successes.
+
+RAR handling is deliberately native and synchronous:
+- multipart RAR sets are opened through part1.rar;
+- overlong (>255 UTF-8 byte) archive path components are excluded from the
+  normal UnRAR extraction, streamed separately, and saved under deterministic
+  shortened names;
+- the complete RAR set is tested before any archive volume can be deleted.
+
+Layout:
+- one top-level wrapper directory: use that wrapper beside the archive;
+- otherwise: contain extracted content in a folder named after the archive.
+
+Existing destination directories are merged only when every collision is
+byte-identical. Different-content collisions retain the archive set.
+"""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO, Iterable, TextIO
+
+VERSION = "0.1.0"
+DEFAULT_ROOT = Path.cwd()
+MAX_COMPONENT_BYTES = 255
+SHORT_COMPONENT_BYTES = 240
+SUPPORTED_SUFFIXES = (".zip", ".rar", ".7z", ".7z.001", ".zip.001")
+
+
+@dataclass
+class ArchiveIdentity:
+    stem: str
+    part_number: int | None = None
+    part_digits: str | None = None
+    part_style: str | None = None
+
+
+class RunLog:
+    def __init__(self, log_path: Path, status_path: Path) -> None:
+        self.log_path = log_path
+        self.status_path = status_path
+        self.log_file: TextIO = log_path.open("w", encoding="utf-8", errors="replace")
+        self.status_file: TextIO = status_path.open("w", encoding="utf-8", errors="replace")
+        self.status_file.write("STATUS\tARCHIVE\tLAYOUT\tDESTINATION\tDETAIL\n")
+        self.status_file.flush()
+
+    def close(self) -> None:
+        self.log_file.close()
+        self.status_file.close()
+
+    def line(self, message: str = "") -> None:
+        print(message, flush=True)
+        self.log_file.write(message + "\n")
+        self.log_file.flush()
+
+    def status(self, status: str, archive: Path, layout: str = "", destination: Path | None = None, detail: str = "") -> None:
+        fields = [status, str(archive), layout, str(destination or ""), detail]
+        clean = [field.replace("\t", " ").replace("\n", "\\n") for field in fields]
+        self.status_file.write("\t".join(clean) + "\n")
+        self.status_file.flush()
+
+    def run_text(self, command: list[str], *, stdin_devnull: bool = True) -> int:
+        """Run synchronously, streaming combined stdout/stderr to terminal and log."""
+        stdin = subprocess.DEVNULL if stdin_devnull else None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError as exc:
+            self.line(f"COMMAND ERROR: {exc}")
+            return 127
+
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            # UnRAR progress uses backspaces. Preserve useful text but remove the
+            # terminal-control noise from persistent logs.
+            clean = raw_line.replace("\b", "")
+            print(clean, end="", flush=True)
+            self.log_file.write(clean)
+        process.stdout.close()
+        rc = process.wait()
+        self.log_file.flush()
+        return rc
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="extract-archives-cleanup",
+        description="Sequentially extract ZIP/RAR/7z archives and optionally delete successful archive sets.",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--delete-successful",
+        action="store_true",
+        help="permanently delete each complete archive set only after verified extraction and placement",
+    )
+    group.add_argument(
+        "--keep-archives",
+        action="store_true",
+        help="keep archives after successful extraction (default)",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="directory for detailed logs and TSV status reports (default: XDG state directory)",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument(
+        "root",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_ROOT,
+        help="directory tree to scan recursively (default: current directory)",
+    )
+    return parser.parse_args()
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def archive_identity(filename: str) -> ArchiveIdentity:
+    match = re.match(r"^(.*)\.part(\d+)\.rar$", filename, flags=re.IGNORECASE)
+    if match:
+        return ArchiveIdentity(match.group(1), int(match.group(2)), match.group(2), "named")
+
+    match = re.match(r"^part(\d+)\.rar$", filename, flags=re.IGNORECASE)
+    if match:
+        # Bare sets are inherently ambiguous. Keep the first volume's basename
+        # as the fallback folder name, matching the user's stated expectation.
+        return ArchiveIdentity(filename[:-4], int(match.group(1)), match.group(1), "bare")
+
+    lower = filename.lower()
+    if lower.endswith(".7z.001"):
+        return ArchiveIdentity(filename[:-7])
+    if lower.endswith(".zip.001"):
+        return ArchiveIdentity(filename[:-8])
+    if lower.endswith(".rar") or lower.endswith(".zip"):
+        return ArchiveIdentity(filename[:-4])
+    if lower.endswith(".7z"):
+        return ArchiveIdentity(filename[:-3])
+    return ArchiveIdentity("extracted-archive")
+
+
+def is_candidate(path: Path) -> bool:
+    lower = path.name.lower()
+    return any(lower.endswith(suffix) for suffix in SUPPORTED_SUFFIXES)
+
+
+def scan_candidates(root: Path, staging_name: str) -> list[Path]:
+    candidates: list[Path] = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories[:] = sorted(d for d in directories if d != staging_name)
+        for filename in sorted(files):
+            path = Path(current) / filename
+            if is_candidate(path):
+                candidates.append(path)
+    return candidates
+
+
+def natural_part_key(path: Path) -> tuple[str, int, str]:
+    match = re.search(r"(\d+)(?=\.[^.]+$|$)", path.name)
+    number = int(match.group(1)) if match else -1
+    return (path.name.lower(), number, path.name)
+
+
+def archive_members(archive: Path, identity: ArchiveIdentity) -> list[Path]:
+    files = [path for path in archive.parent.iterdir() if path.is_file()]
+    lower_name = archive.name.lower()
+    stem_lower = identity.stem.lower()
+    members: list[Path] = []
+
+    for candidate in files:
+        name = candidate.name
+        lower = name.lower()
+        include = False
+
+        if identity.part_style == "named":
+            include = re.match(rf"^{re.escape(stem_lower)}\.part\d+\.rar$", lower) is not None
+        elif identity.part_style == "bare":
+            include = re.match(r"^part\d+\.rar$", lower) is not None
+        elif lower_name.endswith(".7z.001"):
+            include = re.match(rf"^{re.escape(stem_lower)}\.7z\.\d+$", lower) is not None
+        elif lower_name.endswith(".zip.001"):
+            include = re.match(rf"^{re.escape(stem_lower)}\.zip\.\d+$", lower) is not None
+        elif lower_name.endswith(".rar"):
+            include = candidate == archive or re.match(rf"^{re.escape(stem_lower)}\.r\d+$", lower) is not None
+        elif lower_name.endswith(".zip"):
+            include = candidate == archive or re.match(rf"^{re.escape(stem_lower)}\.z\d+$", lower) is not None
+        else:
+            include = candidate == archive
+
+        if include:
+            members.append(candidate)
+
+    if not members and archive.exists():
+        members = [archive]
+    return sorted(members, key=natural_part_key)
+
+
+def mount_target(path: Path) -> Path:
+    try:
+        result = subprocess.run(
+            ["findmnt", "--target", str(path), "-n", "-o", "TARGET"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+        )
+        value = result.stdout.strip()
+        if value and Path(value).is_dir():
+            return Path(value)
+    except OSError:
+        pass
+    return path
+
+
+def utf8_prefix(text: str, byte_budget: int) -> str:
+    if byte_budget <= 0:
+        return ""
+    data = text.encode("utf-8", errors="surrogateescape")[:byte_budget]
+    while data:
+        try:
+            return data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            data = data[:-1]
+    return ""
+
+
+def utf8_tail(text: str, byte_budget: int) -> str:
+    if byte_budget <= 0:
+        return ""
+    data = text.encode("utf-8", errors="surrogateescape")
+    if len(data) <= byte_budget:
+        return text
+    data = data[-byte_budget:]
+    while data:
+        try:
+            return data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            data = data[1:]
+    return ""
+
+
+def shorten_component(component: str) -> str:
+    encoded = component.encode("utf-8", errors="surrogateescape")
+    if len(encoded) <= MAX_COMPONENT_BYTES:
+        return component
+
+    # Preserve a short extension and the end of the stem (often a media ID),
+    # while adding a stable digest so two truncations cannot silently collide.
+    extension = ""
+    stem = component
+    dot = component.rfind(".")
+    if 0 < dot < len(component) - 1:
+        candidate_extension = component[dot:]
+        if len(candidate_extension.encode("utf-8", errors="surrogateescape")) <= 20:
+            extension = candidate_extension
+            stem = component[:dot]
+
+    digest = hashlib.sha256(encoded).hexdigest()[:12]
+    tail = utf8_tail(stem, 48)
+    marker = f"~{digest}~"
+    reserved = (marker + tail + extension).encode("utf-8", errors="surrogateescape")
+    prefix_budget = SHORT_COMPONENT_BYTES - len(reserved)
+    prefix = utf8_prefix(stem, max(prefix_budget, 0))
+    result = prefix + marker + tail + extension
+
+    # Defensive final clamp.
+    if len(result.encode("utf-8", errors="surrogateescape")) > SHORT_COMPONENT_BYTES:
+        result = utf8_prefix(stem, 180) + f"~{digest}" + extension
+    return result
+
+
+def safe_archive_path(entry: str) -> PurePosixPath:
+    normalized = entry.replace("\\", "/")
+    pure = PurePosixPath(normalized)
+    if pure.is_absolute():
+        raise ValueError("absolute archive path")
+
+    safe_parts: list[str] = []
+    for part in pure.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValueError("parent traversal in archive path")
+        safe_parts.append(shorten_component(part))
+
+    if not safe_parts:
+        raise ValueError("empty archive path")
+    return PurePosixPath(*safe_parts)
+
+
+def list_rar_entries(archive: Path, log: RunLog) -> list[str] | None:
+    try:
+        result = subprocess.run(
+            ["unrar", "lb", "-p-", str(archive)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        log.line(f"RAR LIST ERROR: {exc}")
+        return None
+
+    if result.returncode != 0:
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                log.line(line)
+        if result.stderr:
+            for line in result.stderr.splitlines():
+                log.line(line)
+        log.line(f"FAILED RAR LISTING: unrar exit code {result.returncode}")
+        return None
+
+    return [line.rstrip("\r") for line in result.stdout.splitlines() if line.rstrip("\r")]
+
+
+def extract_rar(archive: Path, temporary: Path, log: RunLog) -> bool:
+    entries = list_rar_entries(archive, log)
+    if entries is None:
+        return False
+
+    long_entries: list[tuple[str, PurePosixPath, bool]] = []
+    for entry in entries:
+        is_directory = entry.endswith(("/", "\\"))
+        try:
+            safe = safe_archive_path(entry.rstrip("/\\"))
+        except ValueError as exc:
+            log.line(f"UNSAFE ARCHIVE ENTRY: {entry!r}: {exc}")
+            return False
+
+        original_components = [part for part in entry.replace("\\", "/").strip("/").split("/") if part]
+        has_overlong_component = any(
+            len(part.encode("utf-8", errors="surrogateescape")) > MAX_COMPONENT_BYTES
+            for part in original_components
+        )
+        if has_overlong_component:
+            long_entries.append((entry, safe, is_directory))
+
+    exclusion_file: Path | None = None
+    if long_entries:
+        exclusion_file = temporary.parent / f"exclude-{temporary.name}.txt"
+        exclusion_file.write_text(
+            "".join(entry + "\n" for entry, _, _ in long_entries),
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+        log.line(f"Overlong RAR entries requiring safe renaming: {len(long_entries)}")
+
+    command = ["nice", "-n", "10", "unrar", "x", "-p-", "-o-", "-idp"]
+    if exclusion_file is not None:
+        command.append(f"-x@{exclusion_file}")
+    command.extend([str(archive), str(temporary) + os.sep])
+
+    rc = log.run_text(command)
+    if exclusion_file is not None:
+        exclusion_file.unlink(missing_ok=True)
+    if rc != 0:
+        log.line(f"FAILED EXTRACTION: unrar exit code {rc}")
+        return False
+
+    # Recover only the entries that cannot be represented verbatim on ext4.
+    for original, safe_relative, is_directory in long_entries:
+        destination = temporary.joinpath(*safe_relative.parts)
+        if is_directory:
+            destination.mkdir(parents=True, exist_ok=True)
+            log.line(f"RENAMED LONG DIRECTORY: {original} -> {safe_relative}")
+            continue
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(destination.name + ".partial")
+        try:
+            with partial.open("wb") as output:
+                process = subprocess.run(
+                    ["nice", "-n", "10", "unrar", "p", "-inul", "-p-", str(archive), original],
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+        except OSError as exc:
+            partial.unlink(missing_ok=True)
+            log.line(f"FAILED LONG-NAME RECOVERY: {original}: {exc}")
+            return False
+
+        if process.returncode != 0:
+            partial.unlink(missing_ok=True)
+            error_text = process.stderr.decode("utf-8", errors="replace").strip()
+            if error_text:
+                log.line(error_text)
+            log.line(f"FAILED LONG-NAME RECOVERY: unrar exit code {process.returncode}: {original}")
+            return False
+
+        os.replace(partial, destination)
+        log.line(f"RENAMED LONG FILE: {original} -> {safe_relative}")
+
+    # Before any archive can be deleted, verify CRCs and every split volume.
+    log.line("Verifying complete RAR set...")
+    test_rc = log.run_text(["nice", "-n", "10", "unrar", "t", "-p-", "-idp", str(archive)])
+    if test_rc != 0:
+        log.line(f"FAILED RAR VERIFICATION: unrar exit code {test_rc}")
+        return False
+
+    return True
+
+
+def extract_7z_family(archive: Path, temporary: Path, log: RunLog) -> bool:
+    rc = log.run_text(
+        ["nice", "-n", "10", "7z", "x", str(archive), f"-o{temporary}", "-y"],
+        stdin_devnull=True,
+    )
+    if rc != 0:
+        log.line(f"FAILED EXTRACTION: 7z exit code {rc}")
+        return False
+    return True
+
+
+def remove_root_metadata(temporary: Path) -> list[str]:
+    removed: list[str] = []
+    for name in ("__MACOSX", ".DS_Store"):
+        target = temporary / name
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+            removed.append(name)
+        elif target.exists() or target.is_symlink():
+            target.unlink()
+            removed.append(name)
+    return removed
+
+
+def compare_trees(source: Path, destination: Path, log: RunLog, archive: Path, layout: str) -> tuple[bool, int]:
+    identical = 0
+    for current, directories, files in os.walk(source, followlinks=False):
+        current_path = Path(current)
+        relative_root = current_path.relative_to(source)
+
+        for name in directories:
+            source_item = current_path / name
+            target = destination / relative_root / name
+            if source_item.is_symlink():
+                log.line(f"CONFLICT: symbolic-link directory is not merged: {source_item}")
+                log.status("DESTINATION_TYPE_CONFLICT", archive, layout, target, "incoming symlink directory rejected")
+                return False, identical
+            if target.exists() or target.is_symlink():
+                if not target.is_dir() or target.is_symlink():
+                    log.line(f"CONFLICT: incoming directory vs existing non-directory: {target}")
+                    log.status("DESTINATION_TYPE_CONFLICT", archive, layout, target, "incoming directory conflicts with existing item")
+                    return False, identical
+
+        for name in files:
+            source_item = current_path / name
+            target = destination / relative_root / name
+            if not (target.exists() or target.is_symlink()):
+                continue
+            if source_item.is_symlink() or target.is_symlink() or not source_item.is_file() or not target.is_file():
+                log.line(f"CONFLICT: incoming file vs existing different type: {target}")
+                log.status("DESTINATION_TYPE_CONFLICT", archive, layout, target, "incoming file conflicts with existing item")
+                return False, identical
+            if not filecmp.cmp(source_item, target, shallow=False):
+                log.line(f"CONFLICT: existing file differs: {target}")
+                log.status("DESTINATION_CONTENT_CONFLICT", archive, layout, target, "existing file is not byte-identical")
+                return False, identical
+            identical += 1
+    return True, identical
+
+
+def merge_tree(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in list(source.iterdir()):
+        target = destination / item.name
+        if target.exists() or target.is_symlink():
+            if item.is_dir() and not item.is_symlink():
+                merge_tree(item, target)
+                try:
+                    item.rmdir()
+                except OSError:
+                    pass
+            else:
+                # Preflight proved byte identity; keep the existing destination.
+                item.unlink(missing_ok=True)
+        else:
+            shutil.move(str(item), str(target))
+
+
+def place_extracted(
+    archive: Path,
+    identity: ArchiveIdentity,
+    temporary: Path,
+    log: RunLog,
+) -> tuple[bool, str, Path | None]:
+    metadata = remove_root_metadata(temporary)
+    if metadata:
+        log.line(f"Ignored root metadata: {', '.join(metadata)}")
+
+    top = list(temporary.iterdir())
+    if not top:
+        log.line("FAILED: archive produced no extractable content")
+        return False, "", None
+
+    top_directories = [item for item in top if item.is_dir() and not item.is_symlink()]
+    top_others = [item for item in top if not (item.is_dir() and not item.is_symlink())]
+
+    if len(top_directories) == 1 and not top_others:
+        source = top_directories[0]
+        destination = archive.parent / source.name
+        layout = f"WRAPPER:{source.name}"
+        log.line(f"Layout: one wrapper directory — using wrapper '{source.name}'")
+    else:
+        source = temporary
+        destination = archive.parent / identity.stem
+        layout = f"ARCHIVE_NAMED:{identity.stem}"
+        log.line(f"Layout: no single wrapper — using archive-name folder '{identity.stem}'")
+
+    if not (destination.exists() or destination.is_symlink()):
+        shutil.move(str(source), str(destination))
+        log.line(f"SUCCESS: created {destination}")
+        return True, layout, destination
+
+    if not destination.is_dir() or destination.is_symlink():
+        log.line(f"FAILED: destination exists but is not a real directory: {destination}")
+        log.status("FAILED_DESTINATION_NOT_DIRECTORY", archive, layout, destination, "archive retained")
+        return False, layout, destination
+
+    safe, identical = compare_trees(source, destination, log, archive, layout)
+    if not safe:
+        log.line("FAILED: destination conflict; nothing from this archive was merged")
+        return False, layout, destination
+
+    merge_tree(source, destination)
+    log.line(f"SUCCESS: merged into {destination}")
+    if identical:
+        log.line(f"Identical existing files accepted: {identical}")
+    return True, layout, destination
+
+
+def delete_members(members: Iterable[Path], log: RunLog) -> bool:
+    success = True
+    for member in members:
+        if not (member.exists() or member.is_symlink()):
+            continue
+        try:
+            member.unlink()
+            log.line(f"DELETED archive member: {member}")
+        except OSError as exc:
+            log.line(f"DELETE ERROR: {member}: {exc}")
+            success = False
+    return success
+
+
+def main() -> int:
+    args = parse_args()
+    root: Path = args.root.expanduser().resolve()
+    delete_successful = bool(args.delete_successful)
+
+    if not root.is_dir():
+        print(f"ERROR: root directory does not exist: {root}", file=sys.stderr)
+        return 1
+    if not command_exists("7z"):
+        print("ERROR: 7z is not installed or not in PATH.", file=sys.stderr)
+        return 1
+    if not command_exists("unrar"):
+        print("ERROR: unrar is not installed or not in PATH.", file=sys.stderr)
+        return 1
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if args.log_dir is not None:
+        log_dir = args.log_dir.expanduser().resolve()
+    else:
+        state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+        log_dir = state_home / "archive-cleanup-toolkit"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = RunLog(log_dir / f"archive-cleanup-{stamp}.log", log_dir / f"archive-cleanup-{stamp}.tsv")
+
+    staging_base = mount_target(root) / f".archive-cleanup-staging-{os.getuid()}"
+    staging_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(staging_base, 0o700)
+    except OSError:
+        pass
+
+    candidates = scan_candidates(root, staging_base.name)
+    total = len(candidates)
+
+    counters = {
+        "processed": 0,
+        "success_deleted": 0,
+        "success_kept": 0,
+        "delete_errors": 0,
+        "failed_extract": 0,
+        "failed_layout": 0,
+        "failed_destination": 0,
+        "skipped_secondary": 0,
+        "skipped_removed": 0,
+    }
+
+    try:
+        log.line(f"Started: {datetime.now().astimezone().isoformat(timespec='seconds')}")
+        log.line(f"Root: {root}")
+        log.line(f"Candidates found: {total}")
+        log.line(
+            "Archive cleanup: ENABLED — successful archive sets will be permanently deleted"
+            if delete_successful
+            else "Archive cleanup: DISABLED — successful archives will be kept"
+        )
+        log.line(f"Detailed log: {log.log_path}")
+        log.line(f"Status report: {log.status_path}")
+        log.line(f"Staging base: {staging_base}")
+        log.line()
+
+        for index, archive in enumerate(candidates, start=1):
+            counters["processed"] += 1
+            if not archive.exists():
+                log.line(f"[{index}/{total}] SKIP candidate already removed with successful split set: {archive}")
+                log.status("SKIPPED_ALREADY_REMOVED", archive, detail="removed with earlier successful archive set")
+                counters["skipped_removed"] += 1
+                continue
+
+            identity = archive_identity(archive.name)
+            if identity.part_number is not None and identity.part_number != 1:
+                log.line(f"[{index}/{total}] SKIP secondary RAR volume: {archive}")
+                log.status("SKIPPED_SECONDARY_PART", archive, detail=f"part {identity.part_digits}; only part 1 is processed")
+                counters["skipped_secondary"] += 1
+                continue
+
+            members = archive_members(archive, identity)
+            log.line()
+            log.line(f"[{index}/{total}] EXTRACTING: {archive}")
+            log.line(f"Archive-set members detected: {len(members)}")
+
+            temporary = Path(tempfile.mkdtemp(prefix="job.", dir=staging_base))
+            log.line(f"Temporary extraction directory: {temporary}")
+            try:
+                if archive.name.lower().endswith(".rar"):
+                    log.line("Extractor: native UnRAR with long-filename recovery")
+                    extracted = extract_rar(archive, temporary, log)
+                else:
+                    log.line("Extractor: 7-Zip")
+                    extracted = extract_7z_family(archive, temporary, log)
+
+                if not extracted:
+                    log.status("FAILED_EXTRACTION", archive, detail="see detailed log; archive set retained")
+                    counters["failed_extract"] += 1
+                    continue
+
+                try:
+                    placed, layout, destination = place_extracted(archive, identity, temporary, log)
+                except OSError as exc:
+                    log.line(f"FAILED PLACEMENT: {exc}")
+                    log.status("FAILED_PLACEMENT", archive, detail=str(exc))
+                    counters["failed_destination"] += 1
+                    continue
+
+                if not placed or destination is None:
+                    counters["failed_destination"] += 1
+                    continue
+
+                if delete_successful:
+                    if delete_members(members, log):
+                        log.status(
+                            "SUCCESS_DELETED",
+                            archive,
+                            layout,
+                            destination,
+                            f"verified extraction; {len(members)} archive member(s) permanently deleted",
+                        )
+                        counters["success_deleted"] += 1
+                    else:
+                        log.status(
+                            "SUCCESS_ARCHIVE_DELETE_FAILED",
+                            archive,
+                            layout,
+                            destination,
+                            "content extracted but one or more archive members remain",
+                        )
+                        counters["delete_errors"] += 1
+                else:
+                    log.status(
+                        "SUCCESS_KEPT",
+                        archive,
+                        layout,
+                        destination,
+                        "verified extraction; archive retained because deletion was not enabled",
+                    )
+                    counters["success_kept"] += 1
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary, ignore_errors=True)
+
+        log.line()
+        log.line(f"Finished: {datetime.now().astimezone().isoformat(timespec='seconds')}")
+        log.line(f"Candidates processed: {counters['processed']}")
+        log.line(f"Success — archives deleted: {counters['success_deleted']}")
+        log.line(f"Success — archives kept: {counters['success_kept']}")
+        log.line(f"Success — archive deletion errors: {counters['delete_errors']}")
+        log.line(f"Failed extraction: {counters['failed_extract']}")
+        log.line(f"Failed destination/placement: {counters['failed_destination']}")
+        log.line(f"Skipped secondary RAR volumes: {counters['skipped_secondary']}")
+        log.line(f"Skipped candidates already removed with split set: {counters['skipped_removed']}")
+        log.line(f"Detailed log: {log.log_path}")
+        log.line(f"Status report: {log.status_path}")
+    finally:
+        log.close()
+        try:
+            staging_base.rmdir()
+        except OSError:
+            pass
+
+    failures = counters["failed_extract"] + counters["failed_destination"] + counters["delete_errors"]
+    return 2 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
