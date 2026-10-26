@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Password-protected archives in interactive runs: a first passwordless attempt detects protection without hanging, then `extract-archives-cleanup` asks for the password through a hidden prompt (never logged), with a limited number of attempts. A password that works can be reused automatically for later protected archives in the same run. A missing or wrong password keeps the whole archive set. Unattended runs still skip protected archives safely and log them.
+
 ## [0.1.0] - 2026-07-17
 
 ### Added
